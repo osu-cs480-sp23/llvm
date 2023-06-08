@@ -3,6 +3,8 @@
 
 #include <llvm-c/Core.h>
 #include <llvm-c/Analysis.h>
+#include <llvm-c/Target.h>
+#include <llvm-c/TargetMachine.h>
 
 #include "hash.h"
 
@@ -28,6 +30,9 @@ LLVMValueRef build_binop(
             return LLVMBuildFMul(builder, lhs, rhs, "mul_result");
         case '/':
             return LLVMBuildFDiv(builder, lhs, rhs, "div_result");
+        case '<':
+            lhs = LLVMBuildFCmp(builder, LLVMRealULT, lhs, rhs, "lt_result");
+            return LLVMBuildUIToFP(builder, lhs, LLVMFloatType(), "cast_result");
         default:
             fprintf(stderr, "Error: invalid operator: %c\n", op);
             return LLVMGetUndef(LLVMFloatType());
@@ -83,6 +88,113 @@ LLVMValueRef build_variable_val(
     );
 }
 
+LLVMValueRef build_if_else(struct hash* symbols, LLVMBuilderRef builder) {
+    LLVMValueRef cond = build_binop(
+        build_variable_val("b", symbols, builder),
+        build_number(8),
+        '<',
+        builder
+    );
+    cond = LLVMBuildFCmp(
+        builder,
+        LLVMRealUNE,
+        cond,
+        build_number(0),
+        "cond_result"
+    );
+
+    LLVMBasicBlockRef curr_blk = LLVMGetInsertBlock(builder);
+    LLVMValueRef curr_fn = LLVMGetBasicBlockParent(curr_blk);
+    LLVMBasicBlockRef then_blk = LLVMAppendBasicBlock(curr_fn, "then");
+    LLVMBasicBlockRef else_blk = LLVMAppendBasicBlock(curr_fn, "else");
+    LLVMBasicBlockRef continue_blk = LLVMAppendBasicBlock(curr_fn, "continue");
+
+    LLVMBuildCondBr(builder, cond, then_blk, else_blk);
+
+    /*
+     * Then block.
+     */
+    LLVMPositionBuilderAtEnd(builder, then_blk);
+    LLVMValueRef a_times_b = build_binop(
+        build_variable_val("a", symbols, builder),
+        build_variable_val("b", symbols, builder),
+        '*',
+        builder
+    );
+    LLVMValueRef then_assign =
+        build_assignment("c", a_times_b, symbols, builder);
+    LLVMBuildBr(builder, continue_blk);
+
+    /*
+     * Else block.
+     */
+    LLVMPositionBuilderAtEnd(builder, else_blk);
+    LLVMValueRef a_plus_b = build_binop(
+        build_variable_val("a", symbols, builder),
+        build_variable_val("b", symbols, builder),
+        '+',
+        builder
+    );
+    LLVMValueRef else_assign =
+        build_assignment("c", a_plus_b, symbols, builder);
+    LLVMBuildBr(builder, continue_blk);
+
+    LLVMPositionBuilderAtEnd(builder, continue_blk);
+    return LLVMBasicBlockAsValue(continue_blk);
+}
+
+void generate_obj_file(char* filename, LLVMModuleRef module) {
+    LLVMInitializeAllTargetInfos();
+    LLVMInitializeAllTargets();
+    LLVMInitializeAllTargetMCs();
+    LLVMInitializeAllAsmParsers();
+    LLVMInitializeAllAsmPrinters();
+
+    char* triple = LLVMGetDefaultTargetTriple();
+
+    LLVMTargetRef target = NULL;
+    char* error = NULL;
+    LLVMGetTargetFromTriple(triple, &target, &error);
+    if (error) {
+        fprintf(stderr, "Error: %s\n", error);
+        abort();
+    }
+
+    char* cpu = LLVMGetHostCPUName();
+    char* features = LLVMGetHostCPUFeatures();
+
+    fprintf(stderr, "== triple: %s\n", triple);
+    fprintf(stderr, "== cpu: %s\n", cpu);
+    fprintf(stderr, "== features: %s\n", features);
+
+    LLVMTargetMachineRef machine = LLVMCreateTargetMachine(
+        target,
+        triple,
+        cpu,
+        features,
+        LLVMCodeGenLevelNone,
+        LLVMRelocDefault,
+        LLVMCodeModelDefault
+    );
+
+    LLVMTargetMachineEmitToFile(
+        machine,
+        module,
+        filename,
+        LLVMObjectFile,
+        &error
+    );
+    if (error) {
+        fprintf(stderr, "Error: %s\n", error);
+        abort();
+    }
+
+    LLVMDisposeMessage(triple);
+    LLVMDisposeMessage(cpu);
+    LLVMDisposeMessage(features);
+    LLVMDisposeTargetMachine(machine);
+}
+
 int main() {
     LLVMModuleRef module = LLVMModuleCreateWithName("foo.code");
     struct hash* symbols = hash_create();
@@ -121,11 +233,15 @@ int main() {
     );
     LLVMValueRef assgn2 = build_assignment("b", expr3, symbols, builder);
 
-    LLVMBuildRet(builder, build_variable_val("b", symbols, builder));
+    LLVMValueRef if_else = build_if_else(symbols, builder);
+
+    LLVMBuildRet(builder, build_variable_val("c", symbols, builder));
 
     LLVMVerifyModule(module, LLVMAbortProcessAction, NULL);
     char* out = LLVMPrintModuleToString(module);
     printf("%s\n", out);
+
+    generate_obj_file("foo.o", module);
 
     LLVMDisposeModule(module);
     LLVMDisposeBuilder(builder);
